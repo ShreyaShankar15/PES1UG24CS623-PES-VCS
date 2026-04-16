@@ -94,9 +94,88 @@ int object_exists(const ObjectID *id) {
 //
 // Returns 0 on success, -1 on error.
 int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out) {
-    // TODO: Implement
-    (void)type; (void)data; (void)len; (void)id_out;
-    return -1;
+    char header[64];
+    const char *type_str;
+
+    // 1. Convert enum → string
+    if (type == OBJ_BLOB) type_str = "blob";
+    else if (type == OBJ_TREE) type_str = "tree";
+    else if (type == OBJ_COMMIT) type_str = "commit";
+    else return -1;
+
+    // 2. Create header: "blob <size>\0"
+    int header_len = snprintf(header, sizeof(header), "%s %zu", type_str, len) + 1;
+
+    // 3. Allocate full object buffer
+    size_t total_len = header_len + len;
+    char *full = malloc(total_len);
+    if (!full) return -1;
+
+    memcpy(full, header, header_len);
+    memcpy(full + header_len, data, len);
+
+    // 4. Compute hash
+    compute_hash(full, total_len, id_out);
+
+    // 5. If already exists → skip writing
+    if (object_exists(id_out)) {
+        free(full);
+        return 0;
+    }
+
+    // 6. Build path
+    char path[512];
+    object_path(id_out, path, sizeof(path));
+
+    // 7. Create shard directory
+    char dir[512];
+    strncpy(dir, path, sizeof(dir));
+    char *slash = strrchr(dir, '/');
+    if (!slash) {
+        free(full);
+        return -1;
+    }
+    *slash = '\0';
+    mkdir(dir, 0755);
+
+    // 8. Temp file path
+    char temp_path[512];
+    snprintf(temp_path, sizeof(temp_path), "%s/tmpXXXXXX", dir);
+
+    int fd = mkstemp(temp_path);
+    if (fd < 0) {
+        free(full);
+        return -1;
+    }
+
+    // 9. Write data
+    if (write(fd, full, total_len) != (ssize_t)total_len) {
+        close(fd);
+        unlink(temp_path);
+        free(full);
+        return -1;
+    }
+
+    // 10. fsync file
+    fsync(fd);
+    close(fd);
+
+    // 11. Rename temp → final
+    if (rename(temp_path, path) != 0) {
+        unlink(temp_path);
+        free(full);
+        return -1;
+    }
+
+    // 12. fsync directory
+    int dir_fd = open(dir, O_RDONLY);
+    if (dir_fd >= 0) {
+        fsync(dir_fd);
+        close(dir_fd);
+    }
+
+    free(full);
+    return 0;
 }
 
 // Read an object from the store.
